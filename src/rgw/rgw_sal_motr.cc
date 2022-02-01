@@ -3445,10 +3445,10 @@ void *newMotrStore(CephContext *cct)
     const auto& profile  = g_conf().get_val<std::string>("motr_profile_fid");
     const int init_flags = cct->get_init_flags();
     ldout(cct, 0) << "INFO: init flags:        " << init_flags << dendl;
-    ldout(cct, 0) << "INFO: my motr endpoint:  " << proc_ep << dendl;
+    ldout(cct, 0) << "INFO: motr my endpoint:  " << proc_ep << dendl;
     ldout(cct, 0) << "INFO: ha agent endpoint: " << ha_ep << dendl;
-    ldout(cct, 0) << "INFO: my motr fid:       " << proc_fid << dendl;
-    ldout(cct, 0) << "INFO: my other motr fid: " << admin_proc_fid << dendl;
+    ldout(cct, 0) << "INFO: motr my fid:       " << proc_fid << dendl;
+    ldout(cct, 0) << "INFO: motr admin fid:    " << admin_proc_fid << dendl;
     ldout(cct, 0) << "INFO: motr profile fid:  " << profile << dendl;
     store->conf.mc_local_addr  = proc_ep.c_str();
     store->conf.mc_process_fid = proc_fid.c_str();
