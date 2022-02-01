@@ -3269,7 +3269,7 @@ options:
   default: 0x7200000000000001:0x0
   services:
   - rgw    
-- name: my_motr_endpoint
+- name: motr_my_endpoint
   type: str
   level: advanced
   desc: experimental Option to set my Motr endpoint address
