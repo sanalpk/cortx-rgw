@@ -393,11 +393,6 @@ int MotrUser::store_user(const DoutPrefixProvider* dpp,
   obj_version& obj_ver = objv_tr.read_version;
 
   ldpp_dout(dpp, 20) << "Store_user(): User = " << info.user_id.id << dendl;
-  if (!info.user_email.empty()) {
-     MotrEmailInfo MGWEmailInfo(info.user_id.id, info.user_email);
-     store->store_email_info(dpp, y, MGWEmailInfo);
-  }
-
   orig_info.user_id = info.user_id;
   // XXX: we open and close motr idx 2 times in this method:
   // 1) on load_user_from_idx() here and 2) on do_idx_op_by_name(PUT) below.
@@ -448,6 +443,11 @@ int MotrUser::store_user(const DoutPrefixProvider* dpp,
     secret_key = k.key;
     MotrAccessKey MGWUserKeys(access_key, secret_key, info.user_id.to_str());
     store->store_access_key(dpp, y, MGWUserKeys);
+  }
+
+  if (!info.user_email.empty()) {
+     MotrEmailInfo MGWEmailInfo(info.user_id.id, info.user_email);
+     store->store_email_info(dpp, y, MGWEmailInfo);
   }
 
   // Create user info index to store all buckets that are belong
