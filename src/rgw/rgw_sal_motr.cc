@@ -3069,7 +3069,6 @@ int MotrStore::get_user_by_email(const DoutPrefixProvider *dpp, const std::strin
     ldout(cctx, 0) << "Email Id not found: rc = " << rc << dendl;
     return rc;
   }
-  //bufferlist& blr = bl;
   auto iter = bl.cbegin();
   email_info.decode(iter);
   ldout(cctx, 0) << "Loading user: " << email_info.user_id << dendl;
