@@ -393,16 +393,6 @@ int MotrUser::store_user(const DoutPrefixProvider* dpp,
   obj_version& obj_ver = objv_tr.read_version;
 
   ldpp_dout(dpp, 20) << "Store_user(): User = " << info.user_id.id << dendl;
-  std::string access_key;
-  std::string secret_key;
-  if (!info.access_keys.empty()) {
-    std::map<std::string, RGWAccessKey>::const_iterator iter = info.access_keys.begin();
-    const RGWAccessKey& k = iter->second;
-    access_key = k.id;
-    secret_key = k.key;
-    MotrAccessKey MGWUserKeys(access_key, secret_key, info.user_id.to_str());
-    store->store_access_key(dpp, y, MGWUserKeys);
-  }
   if (!info.user_email.empty()) {
      MotrEmailInfo MGWEmailInfo(info.user_id.id, info.user_email);
      store->store_email_info(dpp, y, MGWEmailInfo);
