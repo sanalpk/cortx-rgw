@@ -446,7 +446,7 @@ int MotrUser::store_user(const DoutPrefixProvider* dpp,
   }
 
   if (!info.user_email.empty()) {
-     MotrEmailInfo MGWEmailInfo(info.user_id.id, info.user_email);
+     MotrEmailInfo MGWEmailInfo(info.user_id.to_str(), info.user_email);
      store->store_email_info(dpp, y, MGWEmailInfo);
   }
 
@@ -3110,8 +3110,8 @@ int MotrStore::get_user_by_email(const DoutPrefixProvider *dpp, const std::strin
   auto iter = bl.cbegin();
   email_info.decode(iter);
   ldout(cctx, 0) << "Loading user: " << email_info.user_id << dendl;
-  uinfo.user_id.id = email_info.user_id;
-  rc = load_user_from_idx(dpp, this, uinfo, nullptr, nullptr);
+  uinfo.user_id.from_str(email_info.user_id);
+  rc = MotrUser().load_user_from_idx(dpp, this, uinfo, nullptr, nullptr);
   if (rc < 0){
     ldout(cctx, 0) << "Failed to load user: rc = " << rc << dendl;
     return rc;
