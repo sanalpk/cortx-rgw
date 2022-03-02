@@ -436,6 +436,7 @@ class RadosStore : public Store {
     virtual int meta_remove(const DoutPrefixProvider* dpp, std::string& metadata_key, optional_yield y) override;
     virtual const RGWSyncModuleInstanceRef& get_sync_module() { return rados->get_sync_module(); }
     virtual std::string get_host_id() { return rados->host_id; }
+    virtual void set_host_id(const std::string& host) { /*dummy since it is pure virtual in base */} 
     virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() override;
     virtual std::unique_ptr<RGWRole> get_role(std::string name,
 					      std::string tenant,

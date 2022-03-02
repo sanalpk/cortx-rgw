@@ -759,6 +759,7 @@ public:
 
       virtual const RGWSyncModuleInstanceRef& get_sync_module() { return sync_module; }
       virtual std::string get_host_id() { return ""; }
+      virtual void set_host_id(const std::string& host) {}
 
       virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() override;
       virtual std::unique_ptr<RGWRole> get_role(std::string name,

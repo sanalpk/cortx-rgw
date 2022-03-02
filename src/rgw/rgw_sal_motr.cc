@@ -3224,7 +3224,9 @@ int MotrStore::forward_request_to_master(const DoutPrefixProvider *dpp, User* us
 
 std::string MotrStore::zone_unique_id(uint64_t unique_num)
 {
-  return "";
+                  return zone.zone_unique_id();
+//	return zone.cur_zone_id;
+  //return "";
 }
 
 std::string MotrStore::zone_unique_trans_id(const uint64_t unique_num)

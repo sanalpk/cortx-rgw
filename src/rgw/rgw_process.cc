@@ -285,6 +285,8 @@ int process_request(rgw::sal::Store* const store,
 
   struct req_state rstate(g_ceph_context, &rgw_env, req->id);
   struct req_state *s = &rstate;
+  
+  store->set_host_id(s->info.host);
 
   s->ratelimit_data = ratelimit;
   std::unique_ptr<rgw::sal::User> u = store->get_user(rgw_user());
@@ -302,6 +304,7 @@ int process_request(rgw::sal::Store* const store,
   s->req_id = store->zone_unique_id(req->id);
   s->trans_id = store->zone_unique_trans_id(req->id);
   s->host_id = store->get_host_id();
+  //s->host_id = s->info.host;
   s->yield = yield;
 
   ldpp_dout(s, 2) << "initializing for trans_id = " << s->trans_id << dendl;

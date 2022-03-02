@@ -414,6 +414,7 @@ class MotrZone : public Zone {
     RGWZoneParams *zone_params{nullptr}; /* internal zone params, e.g., rados pools */
     RGWPeriod *current_period{nullptr};
     rgw_zone_id cur_zone_id;
+    std::string uniq_id ="";
 
   public:
     MotrZone(MotrStore* _store) : store(_store) {
@@ -426,6 +427,7 @@ class MotrZone : public Zone {
       zone_params = new RGWZoneParams();
       current_period = new RGWPeriod();
       cur_zone_id = rgw_zone_id(zone_params->get_id());
+      uniq_id = zone_params->get_id();
 
       // XXX: only default and STANDARD supported for now
       RGWZonePlacementInfo info;
@@ -446,6 +448,7 @@ class MotrZone : public Zone {
     virtual bool get_redirect_endpoint(std::string* endpoint) override;
     virtual bool has_zonegroup_api(const std::string& api) const override;
     virtual const std::string& get_current_period_id() override;
+    std::string zone_unique_id () { return uniq_id;}
 };
 
 class MotrLuaScriptManager : public LuaScriptManager {
@@ -877,6 +880,7 @@ class MotrStore : public Store {
     MotrMetaCache* obj_meta_cache;
     MotrMetaCache* user_cache;
     MotrMetaCache* bucket_inst_cache;
+    std::string host_id = "";
 
   public:
     CephContext *cctx;
@@ -954,7 +958,8 @@ class MotrStore : public Store {
     virtual int meta_remove(const DoutPrefixProvider *dpp, std::string& metadata_key, optional_yield y) override;
 
     virtual const RGWSyncModuleInstanceRef& get_sync_module() { return sync_module; }
-    virtual std::string get_host_id() { return ""; }
+    virtual std::string get_host_id() { return host_id; }
+    virtual void set_host_id(const std::string& host) { host_id = host; }
 
     virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() override;
     virtual std::unique_ptr<RGWRole> get_role(std::string name,

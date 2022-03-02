@@ -172,7 +172,7 @@ namespace rgw {
       get_state()->bucket_tenant = tuser->get_tenant();
       get_state()->set_user(tuser);
 
-      ldpp_dout(_s, 2) << "initializing for trans_id = "
+      ldpp_dout(_s, 2) << "2initializing for trans_id = "
 	  << get_state()->trans_id.c_str() << dendl;
 
       int ret = header_init();
@@ -209,7 +209,7 @@ namespace rgw {
 	get_state()->req_id = store->zone_unique_id(id);
 	get_state()->trans_id = store->zone_unique_trans_id(id);
 
-	ldpp_dout(get_state(), 2) << "initializing for trans_id = "
+	ldpp_dout(get_state(), 2) << "3initializing for trans_id = "
 	    << get_state()->trans_id.c_str() << dendl;
       }
 

@@ -352,6 +352,8 @@ class Store {
     virtual int meta_remove(const DoutPrefixProvider* dpp, std::string& metadata_key, optional_yield y) = 0;
     /** Get an instance of the Sync module for bucket sync */
     virtual const RGWSyncModuleInstanceRef& get_sync_module() = 0;
+    /** Set the ID of the current host */
+    virtual void set_host_id(const std::string& host)=0;
     /** Get the ID of the current host */
     virtual std::string get_host_id() = 0;
     /** Get a Lua script manager for running lua scripts */
