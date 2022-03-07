@@ -359,6 +359,12 @@ int MotrUser::load_user_from_idx(const DoutPrefixProvider *dpp,
     objv_tracker.read_version = objv_tr->read_version;
   }
 
+  if (!info.access_keys.empty()) {
+    for(auto key : info.access_keys) {
+      access_key_tracker.insert(key.first);
+    }
+  }
+
   return 0;
 }
 
@@ -443,6 +449,25 @@ int MotrUser::store_user(const DoutPrefixProvider* dpp,
     secret_key = k.key;
     MotrAccessKey MGWUserKeys(access_key, secret_key, info.user_id.to_str());
     store->store_access_key(dpp, y, MGWUserKeys);
+    access_key_tracker.insert(access_key);
+  }
+
+  // Check if any key need to be deleted
+  if (access_key_tracker.size() != info.access_keys.size()) {
+    std::string key_for_deletion;
+    for (auto key : access_key_tracker) {
+      if (!info.get_key(key)) {
+        key_for_deletion = key;
+        ldpp_dout(dpp, 0) << "Deleting access key: " << key_for_deletion << dendl;
+        store->delete_access_key(dpp, y, key_for_deletion);
+        if (rc < 0) {
+          ldpp_dout(dpp, 0) << "Unable to delete access key" << rc << dendl;
+        }
+      }
+    }
+    if(rc >= 0){
+      access_key_tracker.erase(key_for_deletion);
+    }
   }
 
   if (!info.user_email.empty()) {
@@ -481,8 +506,7 @@ int MotrUser::remove_user(const DoutPrefixProvider* dpp, optional_yield y)
   if (!info.access_keys.empty()) {
     for(auto acc_key = info.access_keys.begin(); acc_key != info.access_keys.end(); acc_key++) {
       auto access_key = acc_key->first;
-      rc = store->do_idx_op_by_name(RGW_IAM_MOTR_ACCESS_KEY,
-                              M0_IC_DEL, access_key, bl);
+      rc = store->delete_access_key(dpp, y, access_key);
       // TODO 
       // Check error code for access_key does not exist
       // Continue to next step only if delete failed because key doesn't exists
@@ -1459,19 +1483,31 @@ int MotrObject::MotrDeleteOp::delete_obj(const DoutPrefixProvider* dpp, optional
 {
   ldpp_dout(dpp, 20) << "delete " << source->get_key().to_str() << " from " << source->get_bucket()->get_name() << dendl;
 
+  rgw_bucket_dir_entry ent;
+  int rc = source->get_bucket_dir_ent(dpp, ent);
+  if (rc < 0) {
+    return rc;
+  }
+
+  //TODO: When integrating with background GC for object deletion,
+  // we should consider adding object entry to GC before deleting the metadata.
   // Delete from the cache first.
   source->store->get_obj_meta_cache()->remove(dpp, source->get_key().to_str());
 
   // Delete the object's entry from the bucket index.
   bufferlist bl;
   string bucket_index_iname = "motr.rgw.bucket.index." + source->get_bucket()->get_name();
-  int rc = source->store->do_idx_op_by_name(bucket_index_iname,
+  rc = source->store->do_idx_op_by_name(bucket_index_iname,
                                             M0_IC_DEL, source->get_key().to_str(), bl);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "Failed to del object's entry from bucket index. " << dendl;
     return rc;
   }
 
+  if (ent.meta.size == 0) {
+    ldpp_dout(dpp, 0) << __func__ << ": Object size is 0, not deleting motr object." << dendl;
+    return 0;
+  }
   // Remove the motr objects.
   if (source->category == RGWObjCategory::MultiMeta)
     rc = source->delete_part_objs(dpp);
@@ -1808,7 +1844,7 @@ out:
 int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t end, RGWGetDataCB* cb)
 {
   int rc;
-  unsigned bs, actual;
+  unsigned bs, actual, left;
   struct m0_op *op;
   struct m0_bufvec buf;
   struct m0_bufvec attr;
@@ -1838,10 +1874,13 @@ int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t en
   if (rc < 0)
     goto out;
 
-  actual = bs;
-  for (; off < end; off += actual) {
-    if (end - off < bs)
-        actual = end - off;
+  left = end - off;
+  for (; left > 0; off += actual) {
+    if (left < bs)
+      bs = this->get_optimal_bs(left);
+    actual = bs;
+    if (left < bs)
+      actual = left;
     ldpp_dout(dpp, 20) << "MotrObject::read_mobj(): off=" << off <<
                                             " actual=" << actual << dendl;
     bufferlist bl;
@@ -1851,23 +1890,27 @@ int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t off, int64_t en
     ext.iv_vec.v_count[0] = bs;
     attr.ov_vec.v_count[0] = 0;
 
+    left -= actual;
     // Read from Motr.
     op = nullptr;
     rc = m0_obj_op(this->mobj, M0_OC_READ, &ext, &buf, &attr, 0, 0, &op);
     ldpp_dout(dpp, 20) << "MotrObject::read_mobj(): init read op rc=" << rc << dendl;
-    if (rc != 0)
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << __func__ << ": read failed during m0_obj_op, rc=" << rc << dendl;
       goto out;
+    }
     m0_op_launch(&op, 1);
     rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?:
          m0_rc(op);
     m0_op_fini(op);
     m0_op_free(op);
-    if (rc != 0)
+    if (rc != 0) {
+      ldpp_dout(dpp, 0) << __func__ << ": read failed, m0_op_wait rc=" << rc << dendl;
       goto out;
-
+    }
     // Call `cb` to process returned data.
     ldpp_dout(dpp, 20) << "MotrObject::read_mobj(): call cb to process data" << dendl;
-    cb->handle_data(bl, off, actual);
+    cb->handle_data(bl, 0, actual);
   }
 
 out:
@@ -1908,7 +1951,7 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
     keys[0] = this->get_name();
     rc = store->next_query_by_name(bucket_index_iname, keys, vals);
     if (rc < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
+      ldpp_dout(dpp, 0) << __func__ << "ERROR: NEXT query failed. " << rc << dendl;
       return rc;
     }
 
@@ -1935,7 +1978,7 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
       rc = this->store->do_idx_op_by_name(bucket_index_iname,
                                           M0_IC_GET, this->get_key().to_str(), bl);
       if (rc < 0) {
-        ldpp_dout(dpp, 0) << "ERROR: failed to get object's entry from bucket index: rc="
+        ldpp_dout(dpp, 0) << __func__ << "ERROR: failed to get object's entry from bucket index: rc="
                           << rc << dendl;
         return rc;
       }
@@ -3153,6 +3196,18 @@ int MotrStore::store_access_key(const DoutPrefixProvider *dpp, optional_yield y,
   if (rc < 0){
     ldout(cctx, 0) << "Failed to store key: rc = " << rc << dendl;
     return rc;
+  }
+  return rc;
+}
+
+int MotrStore::delete_access_key(const DoutPrefixProvider *dpp, optional_yield y, std::string access_key)
+{
+  int rc;
+  bufferlist bl;
+  rc = do_idx_op_by_name(RGW_IAM_MOTR_ACCESS_KEY,
+                                M0_IC_DEL, access_key, bl);
+  if (rc < 0){
+    ldout(cctx, 0) << "Failed to delete key: rc = " << rc << dendl;
   }
   return rc;
 }
