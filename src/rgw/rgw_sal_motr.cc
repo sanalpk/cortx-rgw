@@ -938,23 +938,49 @@ std::unique_ptr<Object> MotrBucket::get_object(const rgw_obj_key& k)
 int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max, ListResults& results, optional_yield y)
 {
   int rc;
+  if (max == 0)  // Return an emtpy response.
+    return 0;
+  max++;  // Fetch an extra key if available to ensure presence of next obj.
   vector<string> keys(max);
   vector<bufferlist> vals(max);
 
   ldpp_dout(dpp, 20) << "bucket=" << info.bucket.name
                     << " prefix=" << params.prefix
                     << " marker=" << params.marker
-                    << " max=" << max << dendl;
+                    << " max=" << max - 1 << dendl;
 
   // Retrieve all `max` number of pairs.
   string bucket_index_iname = "motr.rgw.bucket.index." + info.bucket.name;
-  keys[0] = params.marker.empty() ? params.prefix :
-                                    params.marker.to_str();
+
+  // Modify the marker based on its type
+  keys[0] = params.prefix;
+  if (!params.marker.empty()) {
+    keys[0] = params.marker.to_str();
+    // Get the position of delimiter string
+    int delim_pos = keys[0].find(params.delim, params.prefix.length());
+    // If delimiter is present at the very end, append "\xff" to skip all
+    // the dir entries, else append " " to skip the maker key.
+    if (delim_pos == (int)(keys[0].length() - params.delim.length()))
+      keys[0].append("\xff");
+    else
+      keys[0].append(" ");
+  }
+
   rc = store->next_query_by_name(bucket_index_iname, keys, vals, params.prefix,
                                                                  params.delim);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
     return rc;
+  }
+
+  // Check if an extra key was fetched or not
+  if (rc == max) {
+    // One extra key is successfully fetched.
+    results.is_truncated = true;
+    results.next_marker = keys[max - 2];
+    rc--;
+  } else {
+    results.is_truncated = false;
   }
 
   // Process the returned pairs to add into ListResults.
@@ -969,13 +995,6 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
       if (params.list_versions || ent.is_visible())
         results.objs.emplace_back(std::move(ent));
     }
-  }
-
-  if (i == max) {
-    results.is_truncated = true;
-    results.next_marker = keys[max - 1] + " ";
-  } else {
-    results.is_truncated = false;
   }
 
   return 0;
@@ -1693,8 +1712,10 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   if (meta.layout_id == 0) {
     rgw_bucket_dir_entry ent;
     rc = this->get_bucket_dir_ent(dpp, ent);
-    if (rc < 0)
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: open_mobj() failed: rc=" << rc << dendl;
       return rc;
+    }
   }
 
   if (meta.layout_id == 0)
@@ -2457,7 +2478,8 @@ int MotrMultipartUpload::delete_parts(const DoutPrefixProvider *dpp)
   do {
     rc = this->list_parts(dpp, store->ctx(), max_parts, marker, &marker, &truncated);
     if (rc == -ENOENT) {
-      rc = -ERR_NO_SUCH_UPLOAD;
+      truncated = false;
+      rc = 0;
     }
     if (rc < 0)
       return rc;
@@ -2479,9 +2501,10 @@ int MotrMultipartUpload::delete_parts(const DoutPrefixProvider *dpp)
       std::unique_ptr<rgw::sal::Object> obj;
       obj = this->bucket->get_object(rgw_obj_key(part_obj_name));
       std::unique_ptr<rgw::sal::MotrObject> mobj(static_cast<rgw::sal::MotrObject *>(obj.release()));
+      mobj->meta = mmpart->meta;
       rc = mobj->delete_mobj(dpp);
       if (rc < 0) {
-        ldpp_dout(dpp, 0) << "Failed to delete the object from Motr. " << dendl;
+        ldpp_dout(dpp, 0) << __func__ << ": Failed to delete object from Motr. rc=" << rc << dendl;
         return rc;
       }
     }
@@ -2497,21 +2520,29 @@ int MotrMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
                                 RGWObjectCtx *obj_ctx)
 {
   int rc;
+  // Check if multipart upload exists
+  bufferlist bl;
+  std::unique_ptr<rgw::sal::Object> meta_obj;
+  meta_obj = get_meta_obj();
+  string bucket_multipart_iname =
+      "motr.rgw.bucket." + meta_obj->get_bucket()->get_name() + ".multiparts";
+  rc = store->do_idx_op_by_name(bucket_multipart_iname,
+                                  M0_IC_GET, meta_obj->get_key().to_str(), bl);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) << __func__ << ": Failed to get multipart upload. rc=" << rc << dendl;
+    return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
+  }
 
   // Scan all parts and delete the corresponding motr objects.
   rc = this->delete_parts(dpp);
   if (rc < 0)
     return rc;
 
+  bl.clear();
   // Remove the upload from bucket multipart index.
-  bufferlist bl;
-  std::unique_ptr<rgw::sal::Object> meta_obj;
-  meta_obj = get_meta_obj();
-  string bucket_multipart_iname =
-      "motr.rgw.bucket." + meta_obj->get_bucket()->get_name() + ".multiparts";
-  return store->do_idx_op_by_name(bucket_multipart_iname,
+  rc = store->do_idx_op_by_name(bucket_multipart_iname,
                                   M0_IC_DEL, meta_obj->get_key().to_str(), bl);
-  return 0;
+  return rc;
 }
 
 std::unique_ptr<rgw::sal::Object> MotrMultipartUpload::get_meta_obj()
@@ -2619,7 +2650,7 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
 
   std::string oid = mp_obj.get_key();
   string obj_part_iname = "motr.rgw.object." + bucket->get_name() + "." + oid + ".parts";
-  ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): object part index = " << obj_part_iname << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": object part index = " << obj_part_iname << dendl;
   key_vec[0].clear();
   key_vec[0] = "part.";
   char buf[32];
@@ -2633,13 +2664,12 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
 
   int last_num = 0;
   int part_cnt = 0;
-  uint32_t expected_next = marker + 1;
-  ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): marker = " << marker << dendl;
+  uint32_t expected_next = 0;
+  ldpp_dout(dpp, 20) << __func__ << ": marker = " << marker << dendl;
   for (const auto& bl: val_vec) {
     if (bl.length() == 0)
       break;
 
-    ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): get part_info "  << dendl;
     RGWUploadPartInfo info;
     auto iter = bl.cbegin();
     info.decode(iter);
@@ -2648,10 +2678,17 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
     MotrObject::Meta meta;
     meta.decode(iter);
 
-    ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): part_num=" << info.num
+    ldpp_dout(dpp, 20) << __func__ << ": part_num=" << info.num
                                              << " part_size=" << info.size << dendl;
-    if (info.num != expected_next)
+    ldpp_dout(dpp, 20) << __func__ << ": meta:oid=[" << meta.oid.u_hi << "," << meta.oid.u_lo
+                                              << "], meta:pvid=[" << meta.pver.f_container << "," << meta.pver.f_key
+                                              << "], meta:layout id=" << meta.layout_id << dendl;
+
+    if (!expected_next)
+      expected_next = info.num + 1;
+    else if (expected_next && info.num != expected_next)
       return -EINVAL;
+    else expected_next = info.num + 1;
 
     if ((int)info.num > marker) {
       last_num = info.num;
@@ -2659,13 +2696,12 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
     }
 
     part_cnt++;
-    expected_next++;
   }
 
   // Does it have more parts?
   if (truncated)
     *truncated = part_cnt < num_parts? false : true;
-  ldpp_dout(dpp, 20) << "MotrMultipartUpload::list_parts(): truncated=" << *truncated << dendl;
+  ldpp_dout(dpp, 20) << __func__ << ": truncated=" << *truncated << dendl;
 
   if (next_marker)
     *next_marker = last_num;
@@ -2915,8 +2951,8 @@ int MotrMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield 
   int rc = this->store->do_idx_op_by_name(bucket_multipart_iname,
                                           M0_IC_GET, meta_obj->get_key().to_str(), bl);
   if (rc < 0) {
-    ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
-    return rc;
+    ldpp_dout(dpp, 0) << __func__ << ": Failed to get multipart info. rc=" << rc << dendl;
+    return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
   }
 
   rgw_bucket_dir_entry ent;
@@ -3641,6 +3677,13 @@ int MotrStore::next_query_by_name(string idx_name,
       next_key = key_out[i + k - 1] + " ";
     ldout(cctx, 0) << "do_idx_next_op(): next_key=" << next_key << dendl;
     keys[0].assign(next_key.begin(), next_key.end());
+
+    int keys_left = val_out.size() - (i + k);  // i + k gives next index.
+    // Resizing keys & vals vector when `keys_left < batch size`.
+    if (keys_left < (int)nr_kvp) {
+      keys.resize(keys_left);
+      vals.resize(keys_left);
+    }
   }
 
 out:
