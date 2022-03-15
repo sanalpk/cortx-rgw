@@ -500,7 +500,7 @@ int MotrUser::remove_user(const DoutPrefixProvider* dpp, optional_yield y)
   bufferlist bl;
   int rc;
   // Remove the user info from cache.
-  store->get_user_cache()->remove(dpp, info.user_id.id);
+  store->get_user_cache()->remove(dpp, info.user_id.to_str());
 
   // Delete all access key of user
   if (!info.access_keys.empty()) {
