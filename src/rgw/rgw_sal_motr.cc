@@ -3894,6 +3894,8 @@ void *newMotrStore(CephContext *cct)
     const auto& admin_proc_ep  = g_conf().get_val<std::string>("motr_admin_endpoint");
     const auto& admin_proc_fid = g_conf().get_val<std::string>("motr_admin_fid");
     const int init_flags = cct->get_init_flags();
+    store->mc_utils.instance_id = proc_fid;
+    store->mc_utils.proc_ep = proc_ep;
     ldout(cct, 0) << "INFO: motr my endpoint: " << proc_ep << dendl;
     ldout(cct, 0) << "INFO: motr ha endpoint: " << ha_ep << dendl;
     ldout(cct, 0) << "INFO: motr my fid:      " << proc_fid << dendl;
