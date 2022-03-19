@@ -198,7 +198,36 @@ class MotrNotification : public Notification {
     virtual int publish_commit(const DoutPrefixProvider* dpp, uint64_t size,
 			       const ceph::real_time& mtime, const std::string& etag, const std::string& version) override { return 0; }
 };
+struct MotrCommonUtils {
+  std::string zone_name;
+  std::string zone_group;
+  std::string instance_id;
+  std::string proc_ep;
+  MotrCommonUtils()
+  {
+    zone_name = "default";
+    zone_group = "default";
+    instance_id = "default";
+    proc_ep = "0.0.0.0";
+  }
+  std::string gen_host_id()
+  {
+    std::size_t pos = proc_ep.find("@");
+    std::string ipaddr = proc_ep.substr (9,pos-9);
+    return ipaddr +":"+instance_id;
+  }
+  std::string gen_trans_id(uint64_t unique_num)
+  {
+    char buf[41]; /* 2 + 21 + 1 + 16 (timestamp can consume up to 16) + 1 */
+    time_t timestamp = time(NULL);
 
+    snprintf(buf, sizeof(buf), "tx%021llx-%016llx",
+              (unsigned long long)unique_num,
+             (unsigned long long)timestamp);
+    return std::string(buf);
+
+  }
+};
 class MotrUser : public User {
   private:
     MotrStore         *store;
@@ -892,7 +921,7 @@ class MotrStore : public Store {
     struct m0_realm     uber_realm;
     struct m0_config    conf = {};
     struct m0_idx_dix_config dix_conf = {};
-
+    struct MotrCommonUtils mc_utils;
     MotrStore(CephContext *c): zone(this), cctx(c) {}
     ~MotrStore() {
       delete obj_meta_cache;
@@ -964,7 +993,9 @@ class MotrStore : public Store {
     virtual int meta_remove(const DoutPrefixProvider *dpp, std::string& metadata_key, optional_yield y) override;
 
     virtual const RGWSyncModuleInstanceRef& get_sync_module() { return sync_module; }
-    virtual std::string get_host_id() { return ""; }
+    virtual std::string get_host_id() {
+      return mc_utils.gen_host_id();
+    }
 
     virtual std::unique_ptr<LuaScriptManager> get_lua_script_manager() override;
     virtual std::unique_ptr<RGWRole> get_role(std::string name,
