@@ -1447,21 +1447,7 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
       return -ERR_NOT_MODIFIED;
     }
   }
-
-  // Skip opening an empty object.
-  if(source->get_obj_size() == 0)
-    return 0;
-
-  // Open the object here.
-  if (source->category == RGWObjCategory::MultiMeta) {
-    ldpp_dout(dpp, 20) <<__func__<< ": open obj parts..." << dendl;
-    rc = source->get_part_objs(dpp, this->part_objs)? :
-         source->open_part_objs(dpp, this->part_objs);
-    return rc;
-  } else {
-    ldpp_dout(dpp, 20) <<__func__<< ": open object..." << dendl;
-    return source->open_mobj(dpp);
-  }
+  return 0;
 }
 
 int MotrObject::MotrReadOp::read(int64_t off, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp)
@@ -1482,11 +1468,25 @@ int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off, 
 {
   int rc;
 
-  if (source->category == RGWObjCategory::MultiMeta)
+  if (source->category == RGWObjCategory::MultiMeta) {
+    ldpp_dout(dpp, 20) <<__func__<< ": open obj parts..." << dendl;
+    rc = source->get_part_objs(dpp, this->part_objs)? :
+         source->open_part_objs(dpp, this->part_objs);
+    if (rc < 0) {
+      ldpp_dout(dpp, 10) << "ERROR: failed to open motr object: rc=" << rc << dendl;
+      return rc;
+    }
     rc = source->read_multipart_obj(dpp, off, end, cb, part_objs);
-  else
+  }
+  else {
+    ldpp_dout(dpp, 20) <<__func__<< ": open object..." << dendl;
+    rc = source->open_mobj(dpp);
+    if (rc < 0) {
+      ldpp_dout(dpp, 10) << "ERROR: failed to open motr object: rc=" << rc << dendl;
+      return rc;
+    }
     rc = source->read_mobj(dpp, off, end, cb);
-
+  }
   return rc;
 }
 
@@ -3488,6 +3488,12 @@ std::string MotrStore::meta_get_marker(void* handle)
 int MotrStore::meta_remove(const DoutPrefixProvider *dpp, string& metadata_key, optional_yield y)
 {
   return 0;
+}
+int MotrStore::list_users(const DoutPrefixProvider* dpp, const std::string& metadata_key,
+                        std::string& marker, int max_entries, void *&handle,
+                        bool* truncated, std::list<std::string>& users)
+{
+    return 0;
 }
 
 int MotrStore::open_idx(struct m0_uint128 *id, bool create, struct m0_idx *idx)
