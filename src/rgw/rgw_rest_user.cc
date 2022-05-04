@@ -397,6 +397,7 @@ public:
 void RGWOp_User_Remove::execute(optional_yield y)
 {
   std::string uid_str;
+  std::string tenant_name;
   bool purge_data;
 
   RGWUserAdminOpState op_state(store);
@@ -405,6 +406,11 @@ void RGWOp_User_Remove::execute(optional_yield y)
   rgw_user uid(uid_str);
 
   RESTArgs::get_bool(s, "purge-data", false, &purge_data);
+
+  RESTArgs::get_string(s, "tenant", tenant_name, &tenant_name);
+  if (!tenant_name.empty()) {
+    uid.tenant = tenant_name;
+  }
 
   // FIXME: no double checking
   if (!uid.empty())
@@ -627,6 +633,7 @@ void RGWOp_Key_Create::execute(optional_yield y)
   std::string access_key;
   std::string secret_key;
   std::string key_type_str;
+  std::string tenant_name;
 
   bool gen_key;
 
@@ -640,7 +647,11 @@ void RGWOp_Key_Create::execute(optional_yield y)
   RESTArgs::get_string(s, "secret-key", secret_key, &secret_key);
   RESTArgs::get_string(s, "key-type", key_type_str, &key_type_str);
   RESTArgs::get_bool(s, "generate-key", true, &gen_key);
+  RESTArgs::get_string(s, "tenant", tenant_name, &tenant_name);
 
+  if (!tenant_name.empty()) {
+    uid.tenant = tenant_name;
+  }
   op_state.set_user_id(uid);
   op_state.set_subuser(subuser);
   op_state.set_access_key(access_key);

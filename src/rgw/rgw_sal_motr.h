@@ -464,7 +464,13 @@ class MotrZone : public Zone {
       info.storage_classes = sc;
       zone_params->placement_pools["default"] = info;
     }
-    ~MotrZone() = default;
+    ~MotrZone() {
+      delete current_period;
+      delete zone_params;
+      delete zone_public_config;
+      delete zonegroup;
+      delete realm;
+    };
 
     virtual const RGWZoneGroup& get_zonegroup() override;
     virtual int get_zonegroup(const std::string& id, RGWZoneGroup& zonegroup) override;
@@ -510,6 +516,20 @@ class MotrOIDCProvider : public RGWOIDCProvider {
   }
 };
 
+// Used to accumulate remaining write IO chunks of multipart write,
+// in order to make Motr write IO aligned with the parity group size.
+// E.g., for part obj of size of 5.5MB (i.e. object lid=0xb), when the 
+// chunk size is 4MB, MotrObject::write_mobj() will collect each 4MB chunk
+// until the end of data from client. So, in this case, two chunks of 4MB
+// and 1.5MB will be added to 'AccumulateIOCtxt::accumulated_buffer_list'.
+// When both the chucks are read completely, Motr write IO is performed.
+struct AccumulateIOCtxt{
+  // Accumulate buffer from socket until we have data of optimal block size 
+  std::vector<bufferlist> accumulated_buffer_list;
+  uint64_t start_offset = 0;
+  uint64_t total_bufer_sz = 0;
+};
+
 class MotrObject : public Object {
   private:
     MotrStore *store;
@@ -526,6 +546,11 @@ class MotrObject : public Object {
     uint64_t part_off;
     uint64_t part_size;
     uint64_t part_num;
+    // Object size as available from Content-Length header
+    uint64_t expected_obj_size = 0;
+    // Total Number of bytes processed so far
+    uint64_t processed_bytes = 0;
+    struct AccumulateIOCtxt io_ctxt = {};
 
   public:
 
@@ -696,6 +721,7 @@ class MotrObject : public Object {
     void set_category(RGWObjCategory _category) {category = _category;}
     int get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir_entry& ent);
     int update_version_entries(const DoutPrefixProvider *dpp);
+    uint64_t get_processed_bytes() { return processed_bytes; }
 };
 
 // A placeholder locking class for multipart upload.
@@ -771,6 +797,9 @@ protected:
   const std::string part_num_str;
   std::unique_ptr<MotrObject> part_obj;
   uint64_t actual_part_size = 0;
+  // Part object size available from Content-Length header
+  uint64_t expected_part_size = 0;
+  const std::string upload_id;
 
 public:
   MotrMultipartWriter(const DoutPrefixProvider *dpp,
@@ -781,8 +810,13 @@ public:
 		       const rgw_placement_rule *ptail_placement_rule,
 		       uint64_t _part_num, const std::string& part_num_str) :
 				  Writer(dpp, y), store(_store), head_obj(std::move(_head_obj)),
-				  part_num(_part_num), part_num_str(part_num_str)
+				  part_num(_part_num), part_num_str(part_num_str), upload_id(upload->get_upload_id())
   {
+    struct req_state *s = static_cast<struct req_state *>(obj_ctx.get_private());
+    if (s) {
+      // Save the part's size available from Content-Length header
+      expected_part_size = s->content_length;
+    }
   }
   ~MotrMultipartWriter() = default;
 
@@ -861,7 +895,8 @@ class MotrMultipartUpload : public MultipartUpload {
 public:
   MotrMultipartUpload(MotrStore* _store, Bucket* _bucket, const std::string& oid,
                       std::optional<std::string> upload_id, ACLOwner _owner, ceph::real_time _mtime) :
-       MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {}
+       MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {
+       }
   virtual ~MotrMultipartUpload() = default;
 
   virtual const std::string& get_meta() const { return mp_obj.get_meta(); }
@@ -927,6 +962,9 @@ class MotrStore : public Store {
       return "motr";
     }
 
+    virtual int list_users(const DoutPrefixProvider* dpp, const std::string& metadata_key,
+                        std::string& marker, int max_entries, void *&handle,
+                        bool* truncated, std::list<std::string>& users) override;
     virtual std::unique_ptr<User> get_user(const rgw_user& u) override;
     virtual std::string get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y) override;
     virtual int get_user_by_access_key(const DoutPrefixProvider *dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user) override;
@@ -961,7 +999,7 @@ class MotrStore : public Store {
     virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) override;
     virtual void get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota) override;
     virtual int set_buckets_enabled(const DoutPrefixProvider *dpp, std::vector<rgw_bucket>& buckets, bool enabled) override;
-    virtual uint64_t get_new_req_id() override { return 0; }
+    virtual uint64_t get_new_req_id() override;
     virtual int get_sync_policy_handler(const DoutPrefixProvider *dpp,
         std::optional<rgw_zone_id> zone,
         std::optional<rgw_bucket> bucket,
@@ -1005,6 +1043,7 @@ class MotrStore : public Store {
     virtual int get_oidc_providers(const DoutPrefixProvider *dpp,
         const std::string& tenant,
         std::vector<std::unique_ptr<RGWOIDCProvider>>& providers) override;
+    int get_upload_id(std::string tenant_bkt_name, std::string key_name, std::string& upload_id);
     virtual std::unique_ptr<Writer> get_append_writer(const DoutPrefixProvider *dpp,
         optional_yield y,
         std::unique_ptr<rgw::sal::Object> _head_obj,
@@ -1035,7 +1074,6 @@ class MotrStore : public Store {
       luarocks_path = path;
     }
 
-    int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
     void close_idx(struct m0_idx *idx) { m0_idx_fini(idx); }
     int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
       std::vector<uint8_t>& key, std::vector<uint8_t>& val, bool update = false);
