@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <chrono>
 
 extern "C" {
 #pragma clang diagnostic push
@@ -62,9 +63,44 @@ static std::string motr_global_indices[] = {
   RGW_IAM_MOTR_EMAIL_KEY
 };
 
+// version-id(31 byte = base62 timstamp(8-byte) + UUID(23 byte)
+#define TS_LEN 8
+#define UUID_LEN 23
+
 static unsigned roundup(unsigned x, unsigned by)
 {
   return ((x - 1) / by + 1) * by;
+}
+
+std::string base62_encode(uint64_t value, size_t pad)
+{
+  // Integer to Base62 encoding table. Characters are sorted in
+  // lexicographical order, which makes the encoded result
+  // also sortable in the same way as the integer source.
+  constexpr std::array<char, 62> base62_chars{
+      // 0-9
+      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+      // A-Z
+      'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+      'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+      // a-z
+      'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+      'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'};
+
+  std::string ret;
+  ret.reserve(TS_LEN);
+  if (value == 0) {
+    ret = base62_chars[0];
+  }
+
+  while (value > 0) {
+    ret += base62_chars[value % base62_chars.size()];
+    value /= base62_chars.size();
+  }
+  reverse(ret.begin(), ret.end());
+  if (ret.size() < pad) ret.insert(0, pad - ret.size(), base62_chars[0]);
+
+  return ret;
 }
 
 void MotrMetaCache::invalid(const DoutPrefixProvider *dpp,
@@ -275,7 +311,9 @@ int MotrUser::create_bucket(const DoutPrefixProvider* dpp,
     // Create a new bucket: (1) Add a key/value pair in the
     // bucket instance index. (2) Create a new bucket index.
     MotrBucket* mbucket = static_cast<MotrBucket*>(bucket.get());
-    ret = mbucket->put_info(dpp, y, ceph::real_time())? :
+    // "put_info" accepts boolean value mentioning whether to create new or update existing. 
+    // "yield" is not a boolean flag hence explicitly passing true to create a new record.
+    ret = mbucket->put_info(dpp, true, ceph::real_time())? :
           mbucket->create_bucket_index() ? :
           mbucket->create_multipart_indices();
     if (ret < 0)
@@ -731,7 +769,7 @@ int MotrBucket::put_info(const DoutPrefixProvider *dpp, bool exclusive, ceph::re
 
   // Insert bucket instance using bucket's marker (string).
   int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
-                                  M0_IC_PUT, tenant_bkt_name, bl, exclusive);
+                                  M0_IC_PUT, tenant_bkt_name, bl, !exclusive);
   if (rc == 0)
     store->get_bucket_inst_cache()->put(dpp, tenant_bkt_name, bl);
 
@@ -895,10 +933,11 @@ int MotrBucket::check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_qu
 
 int MotrBucket::merge_and_store_attrs(const DoutPrefixProvider *dpp, Attrs& new_attrs, optional_yield y)
 {
-  for (auto& it : new_attrs)
-    attrs[it.first] = it.second;
-
-  return put_info(dpp, y, ceph::real_time());
+  // Assign updated bucket attributes map to attrs map variable
+  attrs = new_attrs;
+  // "put_info" second bool argument is meant to update existing metadata,
+  // which is not needed here. So explicitly passing false.
+  return put_info(dpp, false, ceph::real_time());
 }
 
 int MotrBucket::try_refresh_info(const DoutPrefixProvider *dpp, ceph::real_time *pmtime)
@@ -1065,7 +1104,7 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
       "motr.rgw.bucket." + tenant_bkt_name + ".multiparts";
   key_vec[0].clear();
   key_vec[0].assign(marker.begin(), marker.end());
-  rc = store->next_query_by_name(bucket_multipart_iname, key_vec, val_vec);
+  rc = store->next_query_by_name(bucket_multipart_iname, key_vec, val_vec, prefix, delim);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
     return rc;
@@ -1077,9 +1116,11 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
   int ocount = 0;
   rgw_obj_key last_obj_key;
   *is_truncated = false;
+
   for (const auto& bl: val_vec) {
+    
     if (bl.length() == 0)
-      break;
+      continue;
 
     if((marker != "") && (ocount == 0))
     {
@@ -1252,6 +1293,7 @@ MotrObject::~MotrObject() {
 
 int MotrObject::set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, Attrs* setattrs, Attrs* delattrs, optional_yield y, rgw_obj* target_obj)
 {
+  // TODO : Set tags for multipart objects
   if (this->category == RGWObjCategory::MultiMeta)
     return 0;
 
@@ -1263,23 +1305,41 @@ int MotrObject::set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
     bname = get_bucket_name(this->get_bucket()->get_tenant(), this->get_bucket()->get_name());
     key   = this->get_key().to_str();
   }
-  ldpp_dout(dpp, 20) << "MotrObject::set_obj_attrs(): "
-                    << bname << "/" << key << dendl;
+  ldpp_dout(dpp, 20) <<__func__<< ": " << bname << "/" << key << dendl;
 
-  // Encode object's metadata (those stored in rgw_bucket_dir_entry).
-  bufferlist bl;
-  rgw_bucket_dir_entry ent;
-  ent.encode(bl);
-  encode(attrs, bl);
-
+  // Get object's metadata (those stored in rgw_bucket_dir_entry).
+  bufferlist bl, update_bl;
   string bucket_index_iname = "motr.rgw.bucket.index." + bname;
-  int rc = this->store->do_idx_op_by_name(bucket_index_iname, M0_IC_PUT, key, bl);
+  if (this->store->get_obj_meta_cache()->get(dpp, key, bl)) {
+    // Cache miss !
+    int rc = this->store->do_idx_op_by_name(bucket_index_iname, M0_IC_GET, key, bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) <<__func__<< ": Failed to get object's entry from bucket index. rc=" << rc << dendl;
+      return rc;
+    }
+  }
+
+  rgw_bucket_dir_entry ent;
+  auto iter = bl.cbegin();
+  ent.decode(iter);
+  // Decoding current_attrs before MotrObject::Meta because 
+  // encode and decode always have to be sequential. 
+  rgw::sal::Attrs current_attrs;
+  decode(current_attrs, iter);
+  MotrObject::Meta meta;
+  meta.decode(iter);
+  ent.meta.mtime = ceph::real_clock::now();
+  ent.encode(update_bl);
+  encode(attrs, update_bl);
+  meta.encode(update_bl);
+
+  int rc = this->store->do_idx_op_by_name(bucket_index_iname, M0_IC_PUT, key, update_bl);
   if (rc < 0) {
-    ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. rc=" << rc << dendl;
+    ldpp_dout(dpp, 0) <<__func__<< ": Failed to put object's entry to bucket index. rc=" << rc << dendl;
     return rc;
   }
   // Put into cache.
-  this->store->get_obj_meta_cache()->put(dpp, key, bl);
+  this->store->get_obj_meta_cache()->put(dpp, key, update_bl);
 
   return 0;
 }
@@ -1327,7 +1387,6 @@ int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPr
 int MotrObject::modify_obj_attrs(RGWObjectCtx* rctx, const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp)
 {
   rgw_obj target = get_obj();
-  // TODO: To modularize code across get / set obj attr calls
   int r = get_obj_attrs(rctx, y, dpp, &target);
   if (r < 0) {
     return r;
@@ -1376,11 +1435,22 @@ bool MotrObject::is_expired() {
 // Taken from rgw_rados.cc
 void MotrObject::gen_rand_obj_instance_name()
 {
-  enum {OBJ_INSTANCE_LEN = 32};
-  char buf[OBJ_INSTANCE_LEN + 1];
-
-  gen_rand_alphanumeric_no_underscore(store->ctx(), buf, OBJ_INSTANCE_LEN);
-  key.set_instance(buf);
+  // Creating version-id based on timestamp value
+  // to list/store object versions in lexicographically sorted order.
+  char buf[UUID_LEN + 1];
+  std::string version_id;
+  //TODO: Handle null version object case in PutObj operation.
+  // As the version ID timestamp is encoded in Base62, the maximum value
+  // for 8-characters is 62^8 - 1. This is the maximum time interval in ms.
+  constexpr uint64_t max_ts_count = 218340105584895;
+  using UnsignedMillis = std::chrono::duration<uint64_t, std::milli>;
+  const auto ms_since_epoch = std::chrono::time_point_cast<UnsignedMillis>(
+                              std::chrono::system_clock::now()).time_since_epoch().count();
+  uint64_t cur_time = max_ts_count - ms_since_epoch;
+  auto version_ts = base62_encode(cur_time, TS_LEN);
+  gen_rand_alphanumeric_no_underscore(store->ctx(), buf, UUID_LEN+1);
+  version_id = version_ts + buf;
+  key.set_instance(version_id);
 }
 
 int MotrObject::omap_get_vals(const DoutPrefixProvider *dpp, const std::string& marker, uint64_t count,
@@ -1919,25 +1989,42 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& in_buffer
     return 0;
 
   processed_bytes += left;
+  int64_t available_data = 0;
+  if (io_ctxt.accumulated_buffer_list.size() > 0) {
+    // We are in data accumulation mode
+    available_data = io_ctxt.total_bufer_sz;
+  }
 
   bs = this->get_optimal_bs(left);
   ldpp_dout(dpp, 20) <<__func__<< ": left=" << left << " bs=" << bs << dendl;
-  if (left < bs) {
+  if ((left + available_data) < bs) {
     // Determine if there are any further chunks/bytes from socket to be processed
     int64_t remaining_bytes = expected_obj_size - processed_bytes;
     if (remaining_bytes > 0) {
+      if (io_ctxt.accumulated_buffer_list.size() == 0) {
+        // Save offset
+        io_ctxt.start_offset = offset;
+      }
       // Append current buffer to the list of accumulated buffers
       ldpp_dout(dpp, 20) <<__func__<< " More data (" <<  remaining_bytes << " bytes) in-flight. Accumulating buffer..." << dendl;
       io_ctxt.accumulated_buffer_list.push_back(std::move(data));
-      if (io_ctxt.start_offset == 0)
-        io_ctxt.start_offset = offset;
       io_ctxt.total_bufer_sz += left;
       return 0;
     } else {
-      // Append last buffer
+      // This is last IO. Check if we have previously accumulated buffers.
+      // If not, simply use in_buffer/data
+      if (io_ctxt.accumulated_buffer_list.size() > 0) {
+        // Append last buffer
+        io_ctxt.accumulated_buffer_list.push_back(std::move(data));
+        io_ctxt.total_bufer_sz += left;
+      }
+    }
+  } else if ((left + available_data) == bs)  {
+    // Ready to write data to Motr. Add it to accumulated buffer
+    if (io_ctxt.accumulated_buffer_list.size() > 0) {
       io_ctxt.accumulated_buffer_list.push_back(std::move(data));
       io_ctxt.total_bufer_sz += left;
-    }
+    } // else, simply use in_buffer
   }
 
   rc = m0_bufvec_empty_alloc(&buf, 1) ?:
@@ -1974,7 +2061,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& in_buffer
       unsigned unit_sz = m0_obj_layout_id_to_unit_size(lid);
 
       bs = roundup(left, unit_sz);
-      ldpp_dout(dpp, 20) <<__func__<< " Padding [" << (bs - left) << "] bytes" << dendl;
+      ldpp_dout(dpp, 20) <<__func__<< " left ="<< left << ",bs=" << bs << ", Padding [" << (bs - left) << "] bytes" << dendl;
       data.append_zero(bs - left);
       p = data.c_str();
     }
@@ -1984,6 +2071,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& in_buffer
     ext.iv_vec.v_count[0] = bs;
     attr.ov_vec.v_count[0] = 0;
 
+    ldpp_dout(dpp, 20) <<__func__<< "Write buffer bytes=[" << bs << "], at offset=[" << offset << "]" << dendl;
     op = nullptr;
     rc = m0_obj_op(this->mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, 0, &op);
     if (rc != 0)
@@ -2001,6 +2089,9 @@ out:
   m0_indexvec_free(&ext);
   m0_bufvec_free(&attr);
   m0_bufvec_free2(&buf);
+  // Reset io_ctxt state
+  io_ctxt.start_offset = 0;
+  io_ctxt.total_bufer_sz = 0;
   return rc;
 }
 
@@ -2113,46 +2204,72 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
   if (this->get_bucket()->get_info().versioning_status() == BUCKET_VERSIONED ||
       this->get_bucket()->get_info().versioning_status() == BUCKET_SUSPENDED) {
 
-    rgw_bucket_dir_entry ent_to_check;
-
+    // Check entry in the cache
     if (this->store->get_obj_meta_cache()->get(dpp, this->get_name(), bl) == 0) {
-      iter = bl.cbegin();
-      ent_to_check.decode(iter);
-      if (ent_to_check.is_current()) {
-        ent = ent_to_check;
+        iter = bl.cbegin();
+        ent.decode(iter);
         rc = 0;
         goto out;
+    }
+
+    if(this->have_instance())
+    {
+      // TODO : Handle null version-id scenarios
+
+      // Cache miss.
+      rc = this->store->do_idx_op_by_name(bucket_index_iname,
+                          M0_IC_GET, this->get_key().to_str(), bl);
+      if(rc < 0) {
+        ldpp_dout(dpp, 0) << __func__ << " ERROR: do_idx_op_by_name failed to get object's entry: rc="
+                          << rc << dendl;
+        return rc;
       }
-    }
-
-    ldpp_dout(dpp, 20) <<__func__<< ": versioned bucket!" << dendl;
-    keys[0] = this->get_name();
-    rc = store->next_query_by_name(bucket_index_iname, keys, vals);
-    if (rc < 0) {
-      ldpp_dout(dpp, 0) << __func__ << "ERROR: NEXT query failed. " << rc << dendl;
-      return rc;
-    }
-
-    rc = -ENOENT;
-    for (const auto& bl: vals) {
-      if (bl.length() == 0)
-        break;
 
       iter = bl.cbegin();
-      ent_to_check.decode(iter);
-      if (ent_to_check.is_current()) {
-        ldpp_dout(dpp, 20) <<__func__<< ": found current version!" << dendl;
-        ent = ent_to_check;
-        rc = 0;
+      ent.decode(iter);
+      rc = 0;
+      // Put into the cache
+      this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
+      goto out;
 
-        this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
-
-        break;
-      }
     }
-  } else {
-    if (this->store->get_obj_meta_cache()->get(dpp, this->get_key().to_str(), bl)) {
+    else
+    {  // Version-id instance is empty
+       // Cache miss.
+        keys[0] = this->get_name();
+
+        // Retrieve all 'max' number of pairs.
+        rc = store->next_query_by_name(bucket_index_iname, keys, vals, this->get_name());
+        if (rc < 0) {
+          ldpp_dout(dpp, 0) << __func__ << "ERROR: NEXT query failed. " << rc << dendl;
+          return rc;
+        }
+
+        rc = -ENOENT;
+
+        // Iterating on object keys and return the latest object version
+        for (const auto& bl: vals) {
+          if (bl.length() == 0)
+            break;
+
+          iter = bl.cbegin();
+          ent.decode(iter);
+
+          if (ent.is_current()) {
+            ldpp_dout(dpp, 20) <<__func__<< ": found current version!" << dendl;
+            rc = 0;
+            // Put into the cache
+            this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
+            break;
+          }
+        }
+     }
+    } else {
+    if (this->store->get_obj_meta_cache()->get(dpp, this->get_name(), bl)) {
       ldpp_dout(dpp, 20) <<__func__<< ": non-versioned bucket!" << dendl;
+
+      // TODO : Handle null version-id scenarios
+
       rc = this->store->do_idx_op_by_name(bucket_index_iname,
                                           M0_IC_GET, this->get_key().to_str(), bl);
       if (rc < 0) {
@@ -2568,7 +2685,9 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   ent.meta.owner = owner.to_str();
   ent.meta.owner_display_name = obj.get_bucket()->get_owner()->get_display_name();
   RGWBucketInfo &info = obj.get_bucket()->get_info();
-  if (info.versioning_enabled())
+
+  // Set version and current flag in case of both versioning enabled and suspended case.
+  if (info.versioned())
     ent.flags = rgw_bucket_dir_entry::FLAG_VER | rgw_bucket_dir_entry::FLAG_CURRENT;
   ldpp_dout(dpp, 20) <<__func__<< ": key=" << obj.get_key().to_str()
                     << " etag: " << etag << " user_data=" << user_data << dendl;
@@ -2591,7 +2710,10 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   obj.meta.encode(bl);
   ldpp_dout(dpp, 20) <<__func__<< ": lid=0x" << std::hex << obj.meta.layout_id
                                                            << dendl;
-  if (info.versioning_enabled()) {
+
+  // Update existing object version entries in a bucket,
+  // in case of both versioning enabled and suspended.
+  if (info.versioned()) {
     // get the list of all versioned objects with the same key and
     // unset their FLAG_CURRENT later, if do_idx_op_by_name() is successful.
     // Note: without distributed lock on the index - it is possible that 2
@@ -3719,13 +3841,25 @@ int MotrStore::list_users(const DoutPrefixProvider* dpp, const std::string& meta
                         bool* truncated, std::list<std::string>& users)
 {
   int rc;
+  bufferlist bl;
   if (max_entries <= 0 or max_entries > 1000) {
     max_entries = 1000; 
   }
   vector<string> keys(max_entries + 1);
   vector<bufferlist> vals(max_entries + 1);
+  
+  if(!(marker.empty())){
+    rc = do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                  M0_IC_GET, marker, bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: Invalid marker. " << rc << dendl;
+      return rc;
+    }
+    else {
+      keys[0] = marker;
+    }
+  }
 
-  keys[0] = marker;
   rc = next_query_by_name(RGW_MOTR_USERS_IDX_NAME, keys, vals);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
