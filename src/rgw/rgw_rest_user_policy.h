@@ -7,6 +7,7 @@
 class RGWRestUserPolicy : public RGWRESTOp {
 protected:
   static constexpr int MAX_POLICY_NAME_LEN = 128;
+  static constexpr int MAX_POLICY_SIZE = 2048;
   std::string policy_name;
   std::string user_name;
   std::string policy;
