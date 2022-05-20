@@ -67,6 +67,11 @@ bool RGWRestUserPolicy::validate_input()
     return false;
   }
 
+  if (policy.size() > MAX_POLICY_SIZE) {
+    ldpp_dout(this, 0) << "ERROR: Invalid policy size "<< dendl;
+    return false;
+  }
+
   std::regex regex_policy_name("[A-Za-z0-9:=,.@-]+");
   if (! std::regex_match(policy_name, regex_policy_name)) {
     ldpp_dout(this, 0) << "ERROR: Invalid chars in policy name " << dendl;
@@ -142,15 +147,32 @@ void RGWPutUserPolicy::execute(optional_yield y)
 
   try {
     const Policy p(s->cct, s->user->get_tenant(), bl);
+    uint32_t pol_size_occupied = user->get_inline_policy_size();
+    uint32_t pol_size = policy.size();
+
     map<string, string> policies;
     if (auto it = user->get_attrs().find(RGW_ATTR_USER_POLICY); it != user->get_attrs().end()) {
       bufferlist out_bl = it->second;
       decode(policies, out_bl);
     }
+
+    //if it is an update
+    if (auto it = policies.find(policy_name); it != policies.end()) {
+      pol_size_occupied = pol_size_occupied - (it->second).size();
+    }
+
+    pol_size_occupied = pol_size_occupied + pol_size;
+    if (pol_size_occupied > MAX_POLICY_SIZE) {
+      op_ret = -ERR_QUOTA_EXCEEDED;
+      ldpp_dout(this, 0) << "ERROR: maximum policy size limit exceed for this user ret=" << op_ret << dendl;
+      return;
+    }
+
     bufferlist in_bl;
     policies[policy_name] = policy;
     encode(policies, in_bl);
     user->get_attrs()[RGW_ATTR_USER_POLICY] = in_bl;
+    user->set_inline_policy_size(pol_size_occupied);
 
     op_ret = user->store_user(s, s->yield, false);
     if (op_ret < 0) {
@@ -195,9 +217,9 @@ void RGWGetUserPolicy::execute(optional_yield y)
   if (op_ret < 0) {
     return;
   }
-
   std::unique_ptr<rgw::sal::User> user = store->get_user(rgw_user(user_name));
   op_ret = user->read_attrs(s, s->yield);
+
   if (op_ret == -ENOENT) {
     ldpp_dout(this, 0) << "ERROR: attrs not found for user" << user_name << dendl;
     op_ret = -ERR_NO_SUCH_ENTITY;
@@ -351,6 +373,10 @@ void RGWDeleteUserPolicy::execute(optional_yield y)
     decode(policies, out_bl);
 
     if (auto p = policies.find(policy_name); p != policies.end()) {
+      uint32_t pol_size_occupied = user->get_inline_policy_size();
+      pol_size_occupied = pol_size_occupied - (p->second).size();
+      user->set_inline_policy_size(pol_size_occupied);
+
       bufferlist in_bl;
       policies.erase(p);
       encode(policies, in_bl);
